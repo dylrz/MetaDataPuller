@@ -1,0 +1,11 @@
+.env
+.env.local
+.env.*
+.json
+original-crow-429716-u3-99ed67b05b9b.json
+!package.json
+!package-lock.json
+node_modules/
+data/
+*.logs
+logs/

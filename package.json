@@ -1,0 +1,16 @@
+{
+    "name": "meta-ads-data-puller",
+    "version": "1.0.0",
+    "description": "Data puller for Meta Ads Manager",
+    "main": "index.js",
+    "scripts": {
+        "start": "node index.js",
+        "pull:all": "node index.js all",
+        "pull:campaign": "node index.js campaign"
+    },
+    "dependencies": {
+        "axios": "^1.6.0",
+        "dotenv": "^16.3.1",
+        "googleapis": "^148.0.0"
+    }
+}
