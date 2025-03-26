@@ -24,16 +24,29 @@ if (missingVars.length > 0) {
 const config = {
   accessToken: process.env.META_ACCESS_TOKEN,
   accountIds: process.env.META_ACCOUNT_IDS.split(",").map((id) => id.trim()),
-  apiVersion: process.env.META_API_VERSION || "v18.0",
+  apiVersion: process.env.META_API_VERSION || "v22.0",
   baseUrl: "https://graph.facebook.com",
+  adNamePatterns: process.env.AD_NAME_PATTERNS?.split(",").map((p) =>
+    p.trim()
+  ) || ["HS", "HS_", "HS-", "CL", "DFAD"],
+  accountPatterns: (() => {
+    try {
+      return process.env.ACCOUNT_PATTERNS
+        ? JSON.parse(process.env.ACCOUNT_PATTERNS)
+        : { default: ["HS", "HS_", "HS-", "CL", "DFAD"] };
+    } catch (e) {
+      console.error("Error parsing ACCOUNT_PATTERNS env var:", e.message);
+      return { default: ["HS", "HS_", "HS-", "CL", "DFAD"] };
+    }
+  })(),
   dataDir: process.env.DATA_DIR || "./data",
-  defaultLookbackDays: parseInt(process.env.LOOKBACK_DAYS, 10) || 30, // Reduced from 90 to 30 days
+  defaultLookbackDays: parseInt(process.env.LOOKBACK_DAYS, 10) || 90, // Reduced from 90 to 30 days
   retryAttempts: parseInt(process.env.RETRY_ATTEMPTS, 10) || 3,
   currency: process.env.CURRENCY || "USD",
   // Patterns to match in ad names
-  adNamePatterns: ["HS", "HS_", "HS-", "CL"],
+  adNamePatterns: ["HS", "HS_", "HS-", "CL", "DFAD"],
   // Request throttling to avoid API rate limits - reduced to speed up processing
-  requestDelay: parseInt(process.env.REQUEST_DELAY, 10) || 300, // ms - optimized for ~55 min runtime
+  requestDelay: parseInt(process.env.REQUEST_DELAY, 10) || 300, // ms - optimized for <2hr runtime
   // Options for more aggressive filtering
   enableAdFiltering: process.env.ENABLE_AD_FILTERING !== "false", // Enabled by default
   onlyIncludeActiveAds: process.env.ONLY_INCLUDE_ACTIVE_ADS !== "false", // Only include active/paused ads
@@ -90,8 +103,8 @@ const formatDate = (date) => {
 
 const getDateRange = () => {
   const now = new Date();
-  const startDate = new Date(now.getFullYear(), now.getMonth(), 1); // First day of current month
-  const endDate = now; // Today
+  const startDate = new Date(now.getFullYear(), 0, 1); // January 1st of current year (month 0 = January)
+  const endDate = now; // Today's date
 
   return {
     since: formatDate(startDate),
@@ -102,24 +115,35 @@ const getDateRange = () => {
 // Break date range into chunks for better API handling
 function getDateChunks(startDate, endDate, chunkSizeDays = 30) {
   const chunks = [];
-  const startTime = new Date(startDate).getTime();
-  const endTime = new Date(endDate).getTime();
-  const dayInMs = 86400000; // 24 * 60 * 60 * 1000
+  const start = new Date(startDate);
+  const end = new Date(endDate);
 
-  for (
-    let chunkStart = startTime;
-    chunkStart < endTime;
-    chunkStart += chunkSizeDays * dayInMs
-  ) {
-    const chunkEnd = Math.min(
-      chunkStart + (chunkSizeDays - 1) * dayInMs,
-      endTime
-    );
+  // Log the input parameters
+  console.log(
+    `Creating date chunks from ${formatDate(start)} to ${formatDate(
+      end
+    )} with chunk size ${chunkSizeDays} days`
+  );
+
+  let chunkStart = new Date(start);
+
+  while (chunkStart < end) {
+    let chunkEnd = new Date(chunkStart);
+    chunkEnd.setDate(chunkEnd.getDate() + chunkSizeDays - 1);
+
+    // Ensure chunk end doesn't exceed the overall end date
+    if (chunkEnd > end) {
+      chunkEnd = new Date(end);
+    }
 
     chunks.push({
-      since: formatDate(new Date(chunkStart)),
-      until: formatDate(new Date(chunkEnd)),
+      since: formatDate(chunkStart),
+      until: formatDate(chunkEnd),
     });
+
+    // Move to next chunk start
+    chunkStart = new Date(chunkEnd);
+    chunkStart.setDate(chunkStart.getDate() + 1);
   }
 
   return chunks;
@@ -357,7 +381,6 @@ async function getAccountInfo(accountId) {
 }
 
 // Get all ads from an account that match the name patterns
-// Get all ads from an account that match the name patterns
 async function fetchAdsMatchingPattern(accountId) {
   try {
     const endpoint = `act_${accountId}/ads`;
@@ -379,18 +402,26 @@ async function fetchAdsMatchingPattern(accountId) {
     const allAds = await fetchPaginatedData(endpoint, params);
     console.log(`Found ${allAds.length} total ads in account ${accountId}`);
 
+    // Get account-specific patterns or fall back to default patterns
+    const patternsToUse =
+      config.accountPatterns[accountId] ||
+      config.accountPatterns.default ||
+      config.adNamePatterns;
+
+    console.log(
+      `Using patterns for account ${accountId}: ${patternsToUse.join(", ")}`
+    );
+
     // Filter for ads that match any of the patterns
     const matchingAds = allAds.filter((ad) => {
       if (!ad.name) return false;
 
-      // Check if ad name contains any of our patterns
-      return config.adNamePatterns.some((pattern) => ad.name.includes(pattern));
+      // Check if ad name contains any of our account-specific patterns
+      return patternsToUse.some((pattern) => ad.name.includes(pattern));
     });
 
     console.log(
-      `Found ${
-        matchingAds.length
-      } ads matching patterns ${config.adNamePatterns.join(
+      `Found ${matchingAds.length} ads matching patterns ${patternsToUse.join(
         ", "
       )} in account ${accountId}`
     );
@@ -441,7 +472,14 @@ async function getAdSpendData(adIds, dateRange = getDateRange()) {
       30
     ).filter((chunk) => new Date(chunk.until) <= now);
 
-    console.log(`Using ${dateChunks.length} valid date chunks`);
+    console.log(
+      `Using ${dateChunks.length} valid date chunks from ${dateRange.since} to ${dateRange.until}`
+    );
+
+    // Log the date chunks to debug
+    dateChunks.forEach((chunk, index) => {
+      console.log(`  Chunk ${index + 1}: ${chunk.since} to ${chunk.until}`);
+    });
 
     // Process ads in batches
     for (let i = 0; i < adIds.length; i += batchSize) {
@@ -466,7 +504,10 @@ async function getAdSpendData(adIds, dateRange = getDateRange()) {
             const params = {
               level: "ad",
               time_increment: 1,
-              time_range: chunk,
+              time_range: {
+                since: chunk.since,
+                until: chunk.until,
+              },
               fields: [
                 "ad_id",
                 "ad_name",
@@ -481,16 +522,22 @@ async function getAdSpendData(adIds, dateRange = getDateRange()) {
             const response = await makeApiRequest(url);
 
             if (response?.data?.length) {
+              // Debug information
+              console.log(
+                `Received ${response.data.length} records for ad ${adId} in range ${chunk.since} to ${chunk.until}`
+              );
+
               const nonZeroSpendData = response.data.filter(
                 (record) => parseFloat(record.spend || 0) > 0
               );
 
               if (nonZeroSpendData.length) {
                 allSpendData.push(...nonZeroSpendData);
-                console.log(
-                  `Got ${nonZeroSpendData.length} non-zero spend records for ad ${adId}`
-                );
               }
+            } else {
+              console.log(
+                `N/A: ${adId} in range ${chunk.since} to ${chunk.until}`
+              );
             }
 
             // Small delay to respect rate limits
@@ -499,14 +546,16 @@ async function getAdSpendData(adIds, dateRange = getDateRange()) {
             );
           } catch (error) {
             console.error(
-              `Error fetching insights for ad ID ${adId}: ${error.message}`
+              `Error fetching insights for ad ID ${adId} in range ${chunk.since} to ${chunk.until}: ${error.message}`
             );
           }
         }
       }
     }
 
-    console.log(`Total non-zero spend records: ${allSpendData.length}`);
+    console.log(
+      `Total non-zero spend records collected: ${allSpendData.length}`
+    );
     return allSpendData;
   } catch (error) {
     console.error(`Error fetching ad spend data:`, error.message);
@@ -842,72 +891,104 @@ async function getAdLevelSpend() {
 }
 
 // Generate summary views of the spend data
-
 function generateSpendSummaries(spendData, accountInfoList) {
-  console.log("Debug - Total Spend Data Length:", spendData.length);
-
-  // Log the first few records to verify data
-  console.log("First few spend records:");
-  spendData.slice(0, 5).forEach((record, index) => {
-    console.log(`Record ${index}:`, {
-      ad_id: record.ad_id,
-      spend: record.spend,
-      date_start: record.date_start,
-      account_id: record.account_id,
-    });
-  });
+  console.log("Generating spend summaries from", spendData.length, "records");
 
   const now = new Date();
+  const currentYear = now.getFullYear();
+  const startOfYear = new Date(currentYear, 0, 1); // January 1st
+  const startOfYearStr = formatDate(startOfYear);
+
+  // For 30-day calculation
   const last30Days = new Date(now);
   last30Days.setDate(last30Days.getDate() - 30);
   const last30DaysStr = formatDate(last30Days);
-  console.log("Last 30 Days Cutoff:", last30DaysStr);
+
+  console.log("Year-to-date since:", startOfYearStr);
+  console.log("Last 30 days since:", last30DaysStr);
 
   // Ad-level summary
   const adSummary = [];
   const adSpendMap = {};
 
+  // Campaign-level summary
+  const campaignSummary = [];
+  const campaignSpendMap = {};
+
   // Group by ad_id and sum spend
   spendData.forEach((record) => {
     const adId = record.ad_id;
     const adName = record.ad_name;
+    const campaignId = record.campaign_id;
+    const campaignName = record.campaign_name;
     const date = record.date_start;
     const spend = parseFloat(record.spend || 0);
 
+    // Process ad-level data
     if (!adSpendMap[adId]) {
       adSpendMap[adId] = {
         ad_id: adId,
         ad_name: adName,
+        account_id: record.account_id,
         account_name: record.account_name,
-        campaign_name: record.campaign_name,
-        total_spend: 0,
+        campaign_name: campaignName,
+        total_spend_ytd: 0,
+        spend_last_30days: 0,
       };
     }
 
-    // Add to totals
-    adSpendMap[adId].total_spend += spend;
+    // Process campaign-level data
+    if (campaignId && !campaignSpendMap[campaignId]) {
+      campaignSpendMap[campaignId] = {
+        campaign_id: campaignId,
+        campaign_name: campaignName,
+        account_id: record.account_id,
+        account_name: record.account_name,
+        total_spend_ytd: 0,
+        spend_last_30days: 0,
+      };
+    }
+
+    // Add to YTD totals for current year
+    if (date >= startOfYearStr) {
+      adSpendMap[adId].total_spend_ytd += spend;
+      if (campaignId) {
+        campaignSpendMap[campaignId].total_spend_ytd += spend;
+      }
+    }
 
     // Add to 30 day totals if applicable
     if (date >= last30DaysStr) {
       adSpendMap[adId].spend_last_30days += spend;
+      if (campaignId) {
+        campaignSpendMap[campaignId].spend_last_30days += spend;
+      }
     }
   });
 
   // Convert to array and format
   Object.values(adSpendMap).forEach((ad) => {
-    ad.total_spend = ad.total_spend.toFixed(2);
+    ad.total_spend_ytd = ad.total_spend_ytd.toFixed(2);
+    ad.spend_last_30days = ad.spend_last_30days.toFixed(2);
     adSummary.push(ad);
+  });
+
+  Object.values(campaignSpendMap).forEach((campaign) => {
+    campaign.total_spend_ytd = campaign.total_spend_ytd.toFixed(2);
+    campaign.spend_last_30days = campaign.spend_last_30days.toFixed(2);
+    campaignSummary.push(campaign);
   });
 
   // Sort by total spend (highest first)
   adSummary.sort(
-    (a, b) => parseFloat(b.total_spend) - parseFloat(a.total_spend)
+    (a, b) => parseFloat(b.total_spend_ytd) - parseFloat(a.total_spend_ytd)
   );
 
-  // Save ad-level summary to CSV
-  saveToCSV(adSummary, "meta-ad-level-summary");
+  campaignSummary.sort(
+    (a, b) => parseFloat(b.total_spend_ytd) - parseFloat(a.total_spend_ytd)
+  );
 
-  // Account-level summary (similar to previous response)
+  // Account-level summary
   const accountSummary = [];
   const accountSpendMap = {};
 
@@ -915,7 +996,8 @@ function generateSpendSummaries(spendData, accountInfoList) {
     accountSpendMap[account.id] = {
       account_id: account.id,
       account_name: account.name || "Unknown",
-      matching_ads_spend: 0,
+      account_status: getAccountStatusText(account.account_status),
+      matching_ads_spend_ytd: 0,
       matching_ads_spend_last_30days: 0,
     };
   });
@@ -926,8 +1008,12 @@ function generateSpendSummaries(spendData, accountInfoList) {
     const spend = parseFloat(record.spend || 0);
 
     if (accountSpendMap[accountId]) {
-      accountSpendMap[accountId].matching_ads_spend += spend;
+      // Add to YTD totals for current year
+      if (date >= startOfYearStr) {
+        accountSpendMap[accountId].matching_ads_spend_ytd += spend;
+      }
 
+      // Add to 30 day totals
       if (date >= last30DaysStr) {
         accountSpendMap[accountId].matching_ads_spend_last_30days += spend;
       }
@@ -936,43 +1022,45 @@ function generateSpendSummaries(spendData, accountInfoList) {
 
   // Convert to array and format account summary
   Object.values(accountSpendMap).forEach((account) => {
-    account.matching_ads_spend = account.matching_ads_spend.toFixed(2);
+    account.matching_ads_spend_ytd = account.matching_ads_spend_ytd.toFixed(2);
     account.matching_ads_spend_last_30days =
       account.matching_ads_spend_last_30days.toFixed(2);
     accountSummary.push(account);
   });
 
-  // Calculate totals
-  const totalMatchingAdsSpend = accountSummary.reduce(
-    (sum, account) => sum + parseFloat(account.matching_ads_spend),
+  // Sort accounts by YTD spend
+  accountSummary.sort(
+    (a, b) =>
+      parseFloat(b.matching_ads_spend_ytd) -
+      parseFloat(a.matching_ads_spend_ytd)
+  );
+
+  // Calculate totals for YTD
+  const totalYTDSpend = accountSummary.reduce(
+    (sum, account) => sum + parseFloat(account.matching_ads_spend_ytd),
     0
   );
 
+  // Calculate totals for last 30 days
   const totalLast30DaysSpend = accountSummary.reduce(
     (sum, account) => sum + parseFloat(account.matching_ads_spend_last_30days),
     0
   );
 
-  // Save account-level summary to CSV
-  saveToCSV(accountSummary, "meta-account-level-summary");
-
   // Log summary statistics
   console.log("\n===== Ad Spend Summary =====");
   console.log(
-    `Total spend for matching ads: ${totalMatchingAdsSpend.toFixed(2)} ${
+    `Total spend YTD (${startOfYearStr} to ${formatDate(
+      now
+    )}): ${totalYTDSpend.toFixed(2)} ${config.currency}`
+  );
+  console.log(
+    `Total spend (last 30 days): ${totalLast30DaysSpend.toFixed(2)} ${
       config.currency
     }`
   );
-  console.log(
-    `Total spend for matching ads (last 30 days): ${totalLast30DaysSpend.toFixed(
-      2
-    )} ${config.currency}`
-  );
 
-  return {
-    adSummary,
-    accountSummary,
-  };
+  return { adSummary, campaignSummary, accountSummary };
 }
 
 // Run the script
