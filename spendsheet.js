@@ -40,7 +40,7 @@ const config = {
     }
   })(),
   dataDir: process.env.DATA_DIR || "./data",
-  defaultLookbackDays: parseInt(process.env.LOOKBACK_DAYS, 10) || 90, // Reduced from 90 to 30 days
+  defaultLookbackDays: parseInt(process.env.LOOKBACK_DAYS, 10) || 20, // Reduced from 90 to 30 days
   retryAttempts: parseInt(process.env.RETRY_ATTEMPTS, 10) || 3,
   currency: process.env.CURRENCY || "USD",
   // Patterns to match in ad names
